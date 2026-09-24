@@ -1,0 +1,2 @@
+x = "café"
+print(x)

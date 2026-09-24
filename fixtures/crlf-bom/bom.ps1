@@ -1,0 +1,2 @@
+﻿# powershell
+Write-Host hi

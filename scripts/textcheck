@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""textcheck - repo text hygiene gate: encoding, BOM, line endings, .gitattributes policy.
+
+Scans a file tree for text hygiene violations. Text output is one line per
+finding (``RULE: target: message``) plus a summary line with counts; ``--format
+json`` emits the full report object.
+
+Rules (severity in parentheses):
+  INVALID_UTF8 (error) ............ bytes are not valid UTF-8 (evidence: byte offset)
+  BOM_UTF8 (error, info for .ps1/.txt unless --bom-policy strict)
+  MIXED_EOL (error) ................ file mixes CRLF and bare LF
+  LONE_CR (error) .................. bare CR not followed by LF (evidence: byte offset)
+  ENCODING_COOKIE_MISMATCH (warn) .. Python coding cookie declares non-UTF-8
+                                     while the bytes are valid UTF-8
+  BINARY_AS_TEXT (error) ........... NUL byte in a text-extension file
+  CRLF_NO_GITATTRIBUTES (warn) ..... CRLF present but no ``* text=auto`` / ``eol=``
+                                     rule in the scanned root's .gitattributes
+  NONASCII_NO_POLICY (warn) ........ non-ASCII filename/content with no
+                                     .gitattributes cover at the scanned root
+  SCAN_ERROR (error) ............... file could not be read (environmental)
+
+Exit codes: 0 clean (warnings/info allowed), 1 one or more error findings,
+2 usage/environment error (missing dir, bad flag). Stdlib only, offline,
+read-only: never rewrites files, never converts encodings, no network.
+Binaries (NUL bytes, undecodable bytes in non-text extensions) are skipped
+by design, except NUL-in-text-extension which is reported.
+"""
+import argparse
+import fnmatch
+import json
+import os
+import re
+import sys
+
+TOOL = "textcheck"
+VERSION = "1.0.0"
+
+SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "__pycache__",
+    ".venv", "venv", "dist", "build", "target",
+}
+
+TEXT_EXTS = {
+    ".py", ".pyw", ".txt", ".md", ".markdown", ".rst", ".json", ".jsonl",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".jsonc",
+    ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+    ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".java", ".go", ".rs",
+    ".rb", ".php", ".pl", ".pm", ".html", ".htm", ".css", ".scss",
+    ".xml", ".svg", ".csv", ".tsv", ".sql", ".r", ".lua", ".vim",
+}
+
+# Extensions where a BOM is tolerated as info (Windows-native formats).
+INFO_EXTS = {".ps1", ".txt"}
+
+BOM = b"\xef\xbb\xbf"
+UTF8_NAMES = {"utf-8", "utf8", "utf_8"}
+COOKIE_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-_.a-zA-Z0-9]+)")
+LONE_CR_RE = re.compile(rb"\r(?!\n)")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="Repo text hygiene gate: encoding, BOM, line endings, .gitattributes.",
+    )
+    parser.add_argument("path", nargs="?", default=".",
+                        help="directory tree to scan (default: .)")
+    parser.add_argument("--format", choices=("text", "json"), default="text",
+                        help="output format (default: text)")
+    parser.add_argument("--bom-policy", choices=("lenient", "strict"),
+                        default="lenient",
+                        help="lenient: BOM in .ps1/.txt is info; "
+                             "strict: every BOM is an error (default: lenient)")
+    parser.add_argument("--exclude", action="append", default=[],
+                        metavar="PATTERN",
+                        help=".gitignore-style pattern to skip (repeatable)")
+    parser.add_argument("--exclude-file", default=None, metavar="FILE",
+                        help="file with .gitignore-style patterns, one per line")
+    parser.add_argument("--version", action="version",
+                        version="%(prog)s " + VERSION)
+    return parser.parse_args(argv)
+
+
+def load_exclude_patterns(args):
+    patterns = list(args.exclude)
+    if args.exclude_file:
+        try:
+            with open(args.exclude_file, "r", encoding="utf-8") as fh:
+                patterns.extend(fh.read().splitlines())
+        except OSError as exc:
+            return None, "cannot read --exclude-file %s: %s" % (args.exclude_file, exc)
+    return patterns, None
+
+
+def is_excluded(rel, patterns):
+    rel = rel.replace(os.sep, "/")
+    base = rel.rsplit("/", 1)[-1]
+    for raw in patterns:
+        pat = raw.strip()
+        if not pat or pat.startswith("#"):
+            continue
+        if pat.endswith("/"):
+            directory = pat.rstrip("/")
+            if rel == directory or rel.startswith(directory + "/"):
+                return True
+            continue
+        if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(base, pat):
+            return True
+    return False
+
+
+def gitattributes_covered(root):
+    """True when root/.gitattributes has a `*` rule with text=auto/text/eol=."""
+    try:
+        with open(os.path.join(root, ".gitattributes"), "r",
+                  encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 2 or parts[0] != "*":
+            continue
+        for attr in parts[1:]:
+            if attr in ("text", "text=auto") or attr.startswith("eol="):
+                return True
+    return False
+
+
+def first_non_ascii(text):
+    for char in text:
+        if ord(char) > 127:
+            return char
+    return None
+
+
+def check_bytes(rel, data, covered, bom_policy):
+    """Return finding dicts (without target) for one file's bytes."""
+    ext = os.path.splitext(rel.rsplit("/", 1)[-1])[1].lower()
+    textish = (ext in TEXT_EXTS) or (ext == "")
+
+    if b"\x00" in data:
+        if textish:
+            offset = data.index(b"\x00")
+            return [finding(
+                "BINARY_AS_TEXT", "error",
+                "NUL byte at offset %d in text file (%s)" % (offset, ext or "(no ext)"),
+                evidence="byte offset %d (0x00)" % offset)]
+        return []  # binary by design: skipped
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if not textish:
+            return []  # binary by design: skipped
+        bad = data[exc.start:exc.start + 1]
+        return [finding(
+            "INVALID_UTF8", "error",
+            "invalid UTF-8 at byte offset %d (0x%s)" % (exc.start, bad.hex()),
+            evidence="byte offset %d (0x%s)" % (exc.start, bad.hex()))]
+
+    findings = []
+    body = data
+    if data.startswith(BOM):
+        if bom_policy == "strict" or ext not in INFO_EXTS:
+            findings.append(finding(
+                "BOM_UTF8", "error",
+                "UTF-8 BOM at offset 0 in source file (%s)" % (ext or "(no ext)"),
+                evidence="byte offset 0 (ef bb bf)"))
+        else:
+            findings.append(finding(
+                "BOM_UTF8", "info",
+                "UTF-8 BOM at offset 0 (tolerated for %s)" % ext,
+                evidence="byte offset 0 (ef bb bf)"))
+        body = data[len(BOM):]
+
+    crlf = body.count(b"\r\n")
+    bare_lf = body.count(b"\n") - crlf
+    if crlf and bare_lf:
+        findings.append(finding(
+            "MIXED_EOL", "error",
+            "mixed line endings: %d CRLF + %d bare LF" % (crlf, bare_lf),
+            evidence="%d CRLF, %d bare LF" % (crlf, bare_lf)))
+    lone = LONE_CR_RE.search(body)
+    if lone:
+        findings.append(finding(
+            "LONE_CR", "error",
+            "lone CR at byte offset %d" % lone.start(),
+            evidence="byte offset %d (0x0d)" % lone.start()))
+
+    if ext == ".py":
+        cookie = None
+        for line in text.split("\n")[:2]:
+            match = COOKIE_RE.match(line)
+            if match:
+                cookie = match.group(1)
+                break
+        if cookie and cookie.lower().replace("-", "") not in \
+                {name.replace("-", "") for name in UTF8_NAMES}:
+            findings.append(finding(
+                "ENCODING_COOKIE_MISMATCH", "warn",
+                "coding cookie declares '%s' but content is valid UTF-8" % cookie,
+                evidence="cookie '%s'" % cookie))
+
+    if crlf and not covered:
+        findings.append(finding(
+            "CRLF_NO_GITATTRIBUTES", "warn",
+            "CRLF line endings with no `* text=auto`/`eol=` rule in .gitattributes"))
+
+    non_ascii_name = any(ord(c) > 127 for c in rel)
+    odd = first_non_ascii(text.lstrip("﻿"))
+    if (non_ascii_name or odd) and not covered:
+        if non_ascii_name:
+            detail = "non-ASCII filename %r" % rel
+        else:
+            detail = "non-ASCII content U+%04X (%r)" % (ord(odd), odd)
+        findings.append(finding(
+            "NONASCII_NO_POLICY", "warn",
+            "%s with no .gitattributes policy" % detail,
+            evidence=detail))
+    return findings
+
+
+def finding(rule, severity, message, evidence=None):
+    item = {"rule": rule, "severity": severity, "message": message}
+    if evidence is not None:
+        item["evidence"] = evidence
+    return item
+
+
+def iter_files(root, patterns):
+    collected = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root).replace(os.sep, "/")
+        keep = []
+        for dirname in dirnames:
+            rel = dirname if rel_dir == "." else rel_dir + "/" + dirname
+            if dirname in SKIP_DIRS or is_excluded(rel + "/", patterns):
+                continue
+            keep.append(dirname)
+        dirnames[:] = sorted(keep)
+        for filename in sorted(filenames):
+            rel = filename if rel_dir == "." else rel_dir + "/" + filename
+            if is_excluded(rel, patterns):
+                continue
+            collected.append((rel, os.path.join(dirpath, filename)))
+    return collected
+
+
+def scan_tree(root, patterns, bom_policy):
+    covered = gitattributes_covered(root)
+    findings = []
+    files = iter_files(root, patterns)
+    for rel, full in files:
+        try:
+            with open(full, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            item = finding("SCAN_ERROR", "error",
+                           "cannot read file: %s" % exc,
+                           evidence=str(exc))
+            item["target"] = rel
+            findings.append(item)
+            continue
+        for item in check_bytes(rel.replace(os.sep, "/"), data, covered, bom_policy):
+            item["target"] = rel.replace(os.sep, "/")
+            findings.append(item)
+    findings.sort(key=lambda item: (item["target"], item["rule"]))
+    return findings, len(files)
+
+
+def summarize(findings, file_count):
+    errors = sum(1 for item in findings if item["severity"] == "error")
+    warnings = sum(1 for item in findings if item["severity"] == "warn")
+    infos = sum(1 for item in findings if item["severity"] == "info")
+    return {"files": file_count, "errors": errors,
+            "warnings": warnings, "info": infos}
+
+
+def format_text(findings, counts):
+    lines = ["%s: %s: %s" % (item["rule"], item["target"], item["message"])
+             for item in findings]
+    verdict = "FAIL" if counts["errors"] else "OK"
+    lines.append("%s: %d files: %d errors, %d warnings, %d info (%s)" % (
+        TOOL, counts["files"], counts["errors"],
+        counts["warnings"], counts["info"], verdict))
+    return "\n".join(lines) + "\n"
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    patterns, err = load_exclude_patterns(args)
+    if err is not None:
+        print("%s: error: %s" % (TOOL, err), file=sys.stderr)
+        return 2
+    root = args.path
+    if not os.path.exists(root):
+        print("%s: error: %s: no such directory" % (TOOL, root), file=sys.stderr)
+        return 2
+    if not os.path.isdir(root):
+        print("%s: error: %s: not a directory" % (TOOL, root), file=sys.stderr)
+        return 2
+    findings, file_count = scan_tree(root, patterns, args.bom_policy)
+    counts = summarize(findings, file_count)
+    exit_code = 1 if counts["errors"] else 0
+    if args.format == "json":
+        report = {"tool": TOOL, "version": VERSION,
+                  "root": os.path.abspath(root),
+                  "findings": findings, "counts": counts, "exit": exit_code}
+        sys.stdout.write(json.dumps(report, indent=2) + "\n")
+    else:
+        sys.stdout.write(format_text(findings, counts))
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
