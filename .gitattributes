@@ -1,0 +1,6 @@
+# Byte-exact fixtures: textcheck tests depend on CRLF / lone-CR bytes
+# surviving the git round-trip, so Git must never normalize these files.
+fixtures/windows-mess/mixed.sh -text
+fixtures/windows-mess/crlf.txt -text
+fixtures/windows-mess/lone.txt -text
+fixtures/crlf-bom/crlf.txt -text
